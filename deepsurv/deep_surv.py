@@ -99,10 +99,11 @@ class DeepSurv:
         self.network_1 = network_1
         self.network_2 = network_2
         
-        self.params_1 = lasagne.layers.get_all_params(self.network_1,
+        params_1 = lasagne.layers.get_all_params(self.network_1,
                                                     trainable = True)
-        self.params_2 = lasagne.layers.get_all_params(self.network_2,
+        params_2 = lasagne.layers.get_all_params(self.network_2,
                                                     trainable = True)
+        self.params = params_1.append(params_2)
         
         self.hidden_layers_1 = lasagne.layers.get_all_layers(self.network_1)[1:]
         self.hidden_layers_2 = lasagne.layers.get_all_layers(self.network_2)[1:]
@@ -166,19 +167,22 @@ class DeepSurv:
         )
 
         if max_norm:
-            grads = T.grad(loss, self.params_1)
+            grads = T.grad(loss, self.params)
+            
             scaled_grads = lasagne.updates.total_norm_constraint(grads, max_norm)
+            
             updates = update_fn(
-                scaled_grads, self.params_1, **kwargs
+                scaled_grads, self.params, **kwargs
             )
+            
         else:
             updates = update_fn(
-                loss, self.params_1, **kwargs
+                loss, self.params, **kwargs
             )
 
         if momentum:
             updates = lasagne.updates.apply_nesterov_momentum(updates, 
-                self.params_1, self.learning_rate, momentum=momentum)
+                self.params, self.learning_rate, momentum=momentum)
 
         # If the model was loaded from file, reload params
         if self.restored_update_params:
