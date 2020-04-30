@@ -9,3 +9,6 @@
 # Ignore Saving Results
 experiments/results/
 experiments/data/**/logs/
+
+build/
+notebooks/logs/
