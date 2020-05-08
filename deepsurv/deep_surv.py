@@ -37,10 +37,8 @@ class DeepSurv:
         # self.offset = theano.shared(numpy.zeros(shape = n_in, dtype=numpy.float32))
         # self.scale = theano.shared(numpy.ones(shape = n_in, dtype=numpy.float32))
 
-        network_1 = lasagne.layers.InputLayer(shape=(None,n_in),
-            input_var = self.X)
-        network_2 = lasagne.layers.InputLayer(shape=(None,n_in),
-            input_var = self.X)
+        network = lasagne.layers.InputLayer(shape=(None,n_in), input_var = self.X)
+        network_2 = lasagne.layers.InputLayer(shape=(None,n_in), input_var = self.X)
 
         # if standardize:
         #     network = lasagne.layers.standardize(network,self.offset,
@@ -63,8 +61,8 @@ class DeepSurv:
                 # TODO: implement other initializations
                 W_init = lasagne.init.GlorotUniform()
 
-            network_1 = lasagne.layers.DenseLayer(
-                network_1, num_units = n_layer,
+            network = lasagne.layers.DenseLayer(
+                network, num_units = n_layer,
                 nonlinearity = activation_fn,
                 W = W_init
             )
@@ -76,16 +74,16 @@ class DeepSurv:
             )
 
             if batch_norm:
-                network_1 = lasagne.layers.batch_norm(network_1)
+                network = lasagne.layers.batch_norm(network)
                 network_2 = lasagne.layers.batch_norm(network_2)
 
             if not dropout is None:
-                network_1 = lasagne.layers.DropoutLayer(network_1, p = dropout)
+                network = lasagne.layers.DropoutLayer(network, p = dropout)
                 network_2 = lasagne.layers.DropoutLayer(network_2, p = dropout)
 
         # Combine Linear to output Log Hazard Ratio - same as Faraggi
-        network_1 = lasagne.layers.DenseLayer(
-            network_1, num_units = 1,
+        network = lasagne.layers.DenseLayer(
+            network, num_units = 1,
             nonlinearity = lasagne.nonlinearities.linear,
             W = lasagne.init.GlorotUniform()
         )
@@ -95,22 +93,18 @@ class DeepSurv:
             nonlinearity = lasagne.nonlinearities.linear,
             W = lasagne.init.GlorotUniform()
         )
-
-        self.network_1 = network_1
+        
+        self.network_1 = network
         self.network_2 = network_2
+        self.network_combine = lasagne.layers.ConcatLayer([network, network_2])
         
-        params_1 = lasagne.layers.get_all_params(self.network_1,
-                                                    trainable = True)
-        params_2 = lasagne.layers.get_all_params(self.network_2,
-                                                    trainable = True)
-        self.params = params_1.append(params_2)
+        self.params = lasagne.layers.get_all_params(self.network_combine, trainable = True)
         
-        self.hidden_layers_1 = lasagne.layers.get_all_layers(self.network_1)[1:]
-        self.hidden_layers_2 = lasagne.layers.get_all_layers(self.network_2)[1:]
-
+        self.hidden_layers = lasagne.layers.get_all_layers(self.network_combine)[1:]
+        
         # Relevant Functions
-        self.partial_hazard_1 = T.exp(self.risk(self.network_1, deterministic = True)) 
-        self.partial_hazard_2 = T.exp(self.risk(self.network_2, deterministic = True)) 
+        self.partial_hazard = T.exp(self.risk(self.network_1, deterministic = True)) # e^h(x)
+       
 
         # Store and set needed Hyper-parameters:
         self.hyperparams = {
@@ -135,20 +129,15 @@ class DeepSurv:
         self.momentum = momentum
         self.restored_update_params = None
 
-    def _negative_log_likelihood(self, E, deterministic = False):
+    def _negative_log_likelihood(self, network, E, deterministic = False):
         
-        risk_1 = self.risk(self.network_1, deterministic)
-        risk_2 = self.risk(self.network_2, deterministic)
-        hazard_ratio_1 = T.exp(risk_1)
-        hazard_ratio_2 = T.exp(risk_2)
-        log_risk_1 = T.log(T.extra_ops.cumsum(hazard_ratio_1))
-        log_risk_2 = T.log(T.extra_ops.cumsum(hazard_ratio_2))
-        uncensored_likelihood_1 = risk_1.T - log_risk_1
-        uncensored_likelihood_2 = risk_2.T - log_risk_2
-        censored_likelihood_1 = uncensored_likelihood_1 * E
-        censored_likelihood_2 = uncensored_likelihood_2 * E
+        risk = self.risk(network, deterministic)
+        hazard_ratio = T.exp(risk)
+        log_risk = T.log(T.extra_ops.cumsum(hazard_ratio))
+        uncensored_likelihood = risk.T - log_risk
+        censored_likelihood = uncensored_likelihood * E
         num_observed_events = T.sum(E)
-        neg_likelihood = - ( T.sum(censored_likelihood_1) - T.sum(censored_likelihood_2) ) / num_observed_events
+        neg_likelihood = -T.sum(censored_likelihood) / num_observed_events
         return neg_likelihood
 
     def _get_loss_updates(self,
@@ -157,24 +146,24 @@ class DeepSurv:
     max_norm = None, deterministic = False,
     momentum = 0.9,
     **kwargs):
-
+        
+        
         loss = (
-            self._negative_log_likelihood(self.E, deterministic)
-            + regularize_layer_params(self.network_1,l1) * L1_reg
+            self._negative_log_likelihood(self.network_1, self.E, deterministic)
+            + self._negative_log_likelihood(self.network_2, self.E, deterministic)
+            + regularize_layer_params(self.network_1, l1) * L1_reg
+            + regularize_layer_params(self.network_1, l2) * L2_reg
             + regularize_layer_params(self.network_2, l1) * L1_reg
-            + (regularize_layer_params(self.network_1, l2)
-            - regularize_layer_params(self.network_2, l2)) * L2_reg
+            + regularize_layer_params(self.network_2, l2) * L2_reg
+            + (regularize_layer_params(self.network_1, l2) - regularize_layer_params(self.network_2, l2)) * L2_reg
         )
 
         if max_norm:
-            grads = T.grad(loss, self.params)
-            
+            grads = T.grad(loss,self.params)
             scaled_grads = lasagne.updates.total_norm_constraint(grads, max_norm)
-            
             updates = update_fn(
                 scaled_grads, self.params, **kwargs
             )
-            
         else:
             updates = update_fn(
                 loss, self.params, **kwargs
@@ -203,7 +192,6 @@ class DeepSurv:
             L1_reg, L2_reg, deterministic = False,
             learning_rate=learning_rate, **kwargs
         )
-        
         train_fn = theano.function(
             inputs = [self.X, self.E],
             outputs = loss,
@@ -222,23 +210,18 @@ class DeepSurv:
             name = 'valid'
         )
         return train_fn, valid_fn
+    
 
     def get_concordance_index(self, x, t, e, **kwargs):
         
-        compute_hazards_1 = theano.function(
+        compute_hazards = theano.function(
             inputs = [self.X],
-            outputs = -self.partial_hazard_1
+            outputs = -self.partial_hazard
         )
-        compute_hazards_2 = theano.function(
-            inputs = [self.X],
-            outputs = -self.partial_hazard_2
-        )
-        partial_hazards_1 = compute_hazards_1(x)
-        partial_hazards_2 = compute_hazards_2(x)
+        partial_hazards = compute_hazards(x)
 
         return concordance_index(t,
-            partial_hazards_1, 
-            partial_hazards_2,                  
+            partial_hazards,
             e)
 
     def _standardize_x(self, x):
@@ -324,7 +307,7 @@ class DeepSurv:
 
             if valid_data and (epoch % validation_frequency == 0):
                 validation_loss = valid_fn(x_valid, e_valid)
-                logger.logValue('valid_loss', validation_loss, epoch)
+                logger.logValue('valid_loss',validation_loss, epoch)
 
                 ci_valid = self.get_concordance_index(
                     x_valid,
@@ -338,7 +321,7 @@ class DeepSurv:
                     if validation_loss < best_validation_loss * improvement_threshold:
                         patience = max(patience, epoch * patience_increase)
 
-                    best_params = [param.copy().eval() for param in self.params_1]
+                    best_params = [param.copy().eval() for param in self.params]
                     best_params_idx = epoch
                     best_validation_loss = validation_loss
 
@@ -354,7 +337,20 @@ class DeepSurv:
             ))
         logger.shutdown()
 
-        
+        # Return Logger.getMetrics()
+        # metrics = {
+        #     'train': train_loss,
+        #     'best_params': best_params,
+        #     'best_params_idx' : best_params_idx,
+        #     'train_ci' : train_ci
+        # }
+        # if valid_data:
+        #     metrics.update({
+        #         'valid' : valid_loss,
+        #         'valid_ci': valid_ci,
+        #         'best_valid_ci': max(valid_ci),
+        #         'best_validation_loss':best_validation_loss
+        #     })
         logger.history['best_valid_loss'] = best_validation_loss
         logger.history['best_params'] = best_params
         logger.history['best_params_idx'] = best_params_idx
@@ -376,7 +372,7 @@ class DeepSurv:
             for (idx, param) in enumerate(lst):
                 group.create_dataset(str(idx), data=param)
 
-        weights_out = lasagne.layers.get_all_param_values(self.network_1, trainable=False)
+        weights_out = lasagne.layers.get_all_param_values(self.network_combine, trainable=False)
         if self.updates:
             updates_out = [p.get_value() for p in self.updates.keys()]
         else:
@@ -412,7 +408,7 @@ class DeepSurv:
 
         # Sort them according to the idx to ensure they are set correctly
         sorted_weights_in = sort_params_by_idx(weights_in)
-        lasagne.layers.set_all_param_values(self.network_1, sorted_weights_in, 
+        lasagne.layers.set_all_param_values(self.network_combine, sorted_weights_in, 
             trainable=False)
 
         sorted_updates_in = sort_params_by_idx(updates_in)
@@ -421,27 +417,5 @@ class DeepSurv:
     def risk(self, network, deterministic = False):
         
         return lasagne.layers.get_output(network,
-                                        deterministic)
+                                        deterministic = deterministic)
 
-    def predict_risk(self, x, network):
-        
-        risk_fxn = theano.function(
-            inputs = [self.X],
-            outputs = self.risk(network, deterministic= True),
-            name = 'predicted risk'
-        )
-        return risk_fxn(x)
-    
-
-def load_model_from_json(model_fp, weights_fp = None):
-    with open(model_fp, 'r') as fp:
-        json_model = fp.read()
-    print('Loading json model:',json_model)
-    hyperparams = json.loads(json_model)
-
-    model = DeepSurv(**hyperparams)
-
-    if weights_fp:
-        model.load_weights(weights_fp)
-
-    return model
